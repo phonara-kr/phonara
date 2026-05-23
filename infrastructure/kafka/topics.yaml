@@ -1,0 +1,237 @@
+# PHONARA V2 - Kafka Topic Configuration
+# Production-Grade Event Streaming Topics
+
+topics:
+  - name: order-events
+    partitions: 12
+    replication-factor: 3
+    config:
+      retention.ms: "604800000"
+      retention.bytes: "10737418240"
+      cleanup.policy: "delete"
+      compression.type: "lz4"
+      min.insync.replicas: "2"
+      segment.bytes: "1073741824"
+    schema:
+      key: user_id
+      value:
+        type: json
+        fields:
+          - event_id
+          - event_type
+          - timestamp
+          - version
+          - source
+          - correlation_id
+          - payload
+
+  - name: trade-events
+    partitions: 20
+    replication-factor: 3
+    config:
+      retention.ms: "2592000000"
+      retention.bytes: "21474836480"
+      cleanup.policy: "delete"
+      compression.type: "lz4"
+      min.insync.replicas: "2"
+      segment.bytes: "1073741824"
+    schema:
+      key: symbol
+      value:
+        type: json
+        fields:
+          - event_id
+          - event_type
+          - timestamp
+          - version
+          - source
+          - correlation_id
+          - payload
+
+  - name: liquidation-events
+    partitions: 10
+    replication-factor: 3
+    config:
+      retention.ms: "2592000000"
+      retention.bytes: "10737418240"
+      cleanup.policy: "delete"
+      compression.type: "lz4"
+      min.insync.replicas: "2"
+      segment.bytes: "536870912"
+    schema:
+      key: user_id
+      value:
+        type: json
+        fields:
+          - event_id
+          - event_type
+          - timestamp
+          - version
+          - source
+          - correlation_id
+          - payload
+
+  - name: wallet-events
+    partitions: 10
+    replication-factor: 3
+    config:
+      retention.ms: "7776000000"
+      retention.bytes: "21474836480"
+      cleanup.policy: "compact,delete"
+      compression.type: "lz4"
+      min.insync.replicas: "2"
+      segment.bytes: "536870912"
+    schema:
+      key: user_id
+      value:
+        type: json
+        fields:
+          - event_id
+          - event_type
+          - timestamp
+          - version
+          - source
+          - correlation_id
+          - payload
+
+  - name: position-events
+    partitions: 10
+    replication-factor: 3
+    config:
+      retention.ms: "7776000000"
+      retention.bytes: "21474836480"
+      cleanup.policy: "compact,delete"
+      compression.type: "lz4"
+      min.insync.replicas: "2"
+      segment.bytes: "536870912"
+    schema:
+      key: user_id
+      value:
+        type: json
+        fields:
+          - event_id
+          - event_type
+          - timestamp
+          - version
+          - source
+          - correlation_id
+          - payload
+
+  - name: price-events
+    partitions: 6
+    replication-factor: 3
+    config:
+      retention.ms: "604800000"
+      retention.bytes: "10737418240"
+      cleanup.policy: "delete"
+      compression.type: "lz4"
+      min.insync.replicas: "2"
+      segment.bytes: "536870912"
+    schema:
+      key: symbol
+      value:
+        type: json
+        fields:
+          - event_id
+          - event_type
+          - timestamp
+          - version
+          - source
+          - correlation_id
+          - payload
+
+consumer-groups:
+  - name: matching-engine-group
+    topics:
+      - order-events
+    config:
+      auto.offset.reset: "latest"
+      enable.auto.commit: "false"
+      max.poll.records: "1000"
+
+  - name: liquidation-engine-group
+    topics:
+      - trade-events
+      - price-events
+    config:
+      auto.offset.reset: "latest"
+      enable.auto.commit: "false"
+      max.poll.records: "500"
+
+  - name: ledger-service-group
+    topics:
+      - trade-events
+      - liquidation-events
+      - wallet-events
+      - position-events
+    config:
+      auto.offset.reset: "earliest"
+      enable.auto.commit: "false"
+      max.poll.records: "100"
+
+  - name: websocket-gateway-group
+    topics:
+      - trade-events
+      - price-events
+      - liquidation-events
+    config:
+      auto.offset.reset: "latest"
+      enable.auto.commit: "true"
+      max.poll.records: "1000"
+
+event-schemas:
+  ORDER_CREATED:
+    topic: order-events
+    partition-key: user_id
+    required-fields:
+      - event_id
+      - event_type
+      - timestamp
+      - correlation_id
+      - payload.order_id
+      - payload.user_id
+      - payload.symbol
+      - payload.side
+      - payload.order_type
+      - payload.price
+      - payload.quantity
+
+  TRADE_EXECUTED:
+    topic: trade-events
+    partition-key: symbol
+    required-fields:
+      - event_id
+      - event_type
+      - timestamp
+      - correlation_id
+      - payload.trade_id
+      - payload.symbol
+      - payload.buyer_id
+      - payload.seller_id
+      - payload.price
+      - payload.quantity
+
+  LIQUIDATION_TRIGGERED:
+    topic: liquidation-events
+    partition-key: user_id
+    required-fields:
+      - event_id
+      - event_type
+      - timestamp
+      - correlation_id
+      - payload.position_id
+      - payload.user_id
+      - payload.current_margin_ratio
+      - payload.maintenance_margin
+
+  WALLET_CREDIT:
+    topic: wallet-events
+    partition-key: user_id
+    required-fields:
+      - event_id
+      - event_type
+      - timestamp
+      - correlation_id
+      - payload.user_id
+      - payload.amount
+      - payload.balance_after

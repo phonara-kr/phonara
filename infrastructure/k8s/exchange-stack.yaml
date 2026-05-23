@@ -1,0 +1,363 @@
+# PHONARA V2 - Kubernetes Deployment Manifests
+# Production-Grade Distributed Exchange System on AWS EKS
+
+---
+apiVersion: v1
+kind: Namespace
+metadata:
+  name: phonara-exchange
+  labels:
+    name: phonara-exchange
+    environment: production
+---
+apiVersion: v1
+kind: Namespace
+metadata:
+  name: phonara-risk
+  labels:
+    name: phonara-risk
+    environment: production
+---
+apiVersion: v1
+kind: Namespace
+metadata:
+  name: phonara-ledger
+  labels:
+    name: phonara-ledger
+    environment: production
+---
+apiVersion: v1
+kind: Namespace
+metadata:
+  name: phonara-gateway
+  labels:
+    name: phonara-gateway
+    environment: production
+---
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: phonara-config
+  namespace: phonara-exchange
+data:
+  KAFKA_BROKERS: "kafka-0.kafka-headless.phonara-exchange:9092,kafka-1.kafka-headless.phonara-exchange:9092,kafka-2.kafka-headless.phonara-exchange:9092"
+  REDIS_HOST: "redis-master.phonara-exchange"
+  REDIS_PORT: "6379"
+  POSTGRES_HOST: "aurora-cluster.cluster-xxxxx.us-east-1.rds.amazonaws.com"
+  POSTGRES_PORT: "5432"
+  POSTGRES_DB: "phonara_ledger"
+  SYMBOLS: "PHON/USD,BTC/USD,ETH/USD"
+  MAINTENANCE_MARGIN: "0.10"
+  LIQUIDATION_PENALTY: "0.025"
+---
+apiVersion: v1
+kind: Secret
+metadata:
+  name: phonara-secrets
+  namespace: phonara-exchange
+type: Opaque
+stringData:
+  POSTGRES_USER: "phonara_admin"
+  POSTGRES_PASSWORD: "${POSTGRES_PASSWORD}"
+  REDIS_PASSWORD: "${REDIS_PASSWORD}"
+  JWT_SECRET: "${JWT_SECRET}"
+  API_KEY: "${API_KEY}"
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: api-gateway
+  namespace: phonara-gateway
+spec:
+  replicas: 3
+  selector:
+    matchLabels:
+      app: api-gateway
+  template:
+    metadata:
+      labels:
+        app: api-gateway
+    spec:
+      containers:
+      - name: api-gateway
+        image: phonara/api-gateway:latest
+        ports:
+        - containerPort: 3000
+        env:
+        - name: NODE_ENV
+          value: "production"
+        resources:
+          requests:
+            cpu: "200m"
+            memory: "256Mi"
+          limits:
+            cpu: "500m"
+            memory: "512Mi"
+        livenessProbe:
+          httpGet:
+            path: /health
+            port: 3000
+          initialDelaySeconds: 10
+          periodSeconds: 10
+        readinessProbe:
+          httpGet:
+            path: /ready
+            port: 3000
+          initialDelaySeconds: 5
+          periodSeconds: 5
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: api-gateway
+  namespace: phonara-gateway
+spec:
+  selector:
+    app: api-gateway
+  ports:
+  - port: 80
+    targetPort: 3000
+  type: ClusterIP
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: order-ingestion
+  namespace: phonara-exchange
+spec:
+  replicas: 2
+  selector:
+    matchLabels:
+      app: order-ingestion
+  template:
+    metadata:
+      labels:
+        app: order-ingestion
+    spec:
+      containers:
+      - name: order-ingestion
+        image: phonara/order-ingestion:latest
+        ports:
+        - containerPort: 3001
+        envFrom:
+        - configMapRef:
+            name: phonara-config
+        - secretRef:
+            name: phonara-secrets
+        resources:
+          requests:
+            cpu: "250m"
+            memory: "512Mi"
+          limits:
+            cpu: "500m"
+            memory: "1Gi"
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: matching-engine
+  namespace: phonara-exchange
+spec:
+  replicas: 3
+  selector:
+    matchLabels:
+      app: matching-engine
+  template:
+    metadata:
+      labels:
+        app: matching-engine
+    spec:
+      affinity:
+        podAntiAffinity:
+          requiredDuringSchedulingIgnoredDuringExecution:
+          - labelSelector:
+              matchExpressions:
+              - key: app
+                operator: In
+                values:
+                - matching-engine
+            topologyKey: "kubernetes.io/hostname"
+      containers:
+      - name: matching-engine
+        image: phonara/matching-engine:latest
+        ports:
+        - containerPort: 3002
+        env:
+        - name: SYMBOL_SHARD
+          valueFrom:
+            fieldRef:
+              fieldPath: metadata.name
+        resources:
+          requests:
+            cpu: "2"
+            memory: "4Gi"
+          limits:
+            cpu: "4"
+            memory: "8Gi"
+        volumeMounts:
+        - name: order-book-cache
+          mountPath: /tmp/orderbook
+      volumes:
+      - name: order-book-cache
+        emptyDir: {}
+---
+apiVersion: autoscaling/v2
+kind: HorizontalPodAutoscaler
+metadata:
+  name: matching-engine-hpa
+  namespace: phonara-exchange
+spec:
+  scaleTargetRef:
+    apiVersion: apps/v1
+    kind: Deployment
+    name: matching-engine
+  minReplicas: 3
+  maxReplicas: 20
+  metrics:
+  - type: Resource
+    resource:
+      name: cpu
+      target:
+        type: Utilization
+        averageUtilization: 70
+  - type: Pods
+    pods:
+      metric:
+        name: orders_per_second
+      target:
+        type: AverageValue
+        averageValue: "8000"
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: liquidation-engine
+  namespace: phonara-risk
+spec:
+  replicas: 2
+  selector:
+    matchLabels:
+      app: liquidation-engine
+  template:
+    metadata:
+      labels:
+        app: liquidation-engine
+    spec:
+      containers:
+      - name: liquidation-engine
+        image: phonara/liquidation-engine:latest
+        ports:
+        - containerPort: 3003
+        envFrom:
+        - configMapRef:
+            name: phonara-config
+        resources:
+          requests:
+            cpu: "1"
+            memory: "2Gi"
+          limits:
+            cpu: "2"
+            memory: "4Gi"
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: ledger-service
+  namespace: phonara-ledger
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: ledger-service
+  template:
+    metadata:
+      labels:
+        app: ledger-service
+    spec:
+      containers:
+      - name: ledger-service
+        image: phonara/ledger-service:latest
+        ports:
+        - containerPort: 3004
+        env:
+        - name: POSTGRES_HOST
+          valueFrom:
+            secretKeyRef:
+              name: phonara-secrets
+              key: postgres-host
+        resources:
+          requests:
+            cpu: "500m"
+            memory: "1Gi"
+          limits:
+            cpu: "1"
+            memory: "2Gi"
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: websocket-gateway
+  namespace: phonara-gateway
+spec:
+  replicas: 3
+  selector:
+    matchLabels:
+      app: websocket-gateway
+  template:
+    metadata:
+      labels:
+        app: websocket-gateway
+    spec:
+      containers:
+      - name: websocket-gateway
+        image: phonara/websocket-gateway:latest
+        ports:
+        - containerPort: 3005
+          protocol: TCP
+        resources:
+          requests:
+            cpu: "500m"
+            memory: "1Gi"
+          limits:
+            cpu: "1"
+            memory: "2Gi"
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: websocket-gateway
+  namespace: phonara-gateway
+spec:
+  selector:
+    app: websocket-gateway
+  ports:
+  - port: 80
+    targetPort: 3005
+  type: ClusterIP
+---
+apiVersion: networking.k8s.io/v1
+kind: Ingress
+metadata:
+  name: phonara-ingress
+  namespace: phonara-gateway
+  annotations:
+    kubernetes.io/ingress.class: alb
+    alb.ingress.kubernetes.io/scheme: internet-facing
+spec:
+  rules:
+  - http:
+      paths:
+      - path: /api
+        pathType: Prefix
+        backend:
+          service:
+            name: api-gateway
+            port:
+              number: 80
+      - path: /ws
+        pathType: Prefix
+        backend:
+          service:
+            name: websocket-gateway
+            port:
+              number: 80
