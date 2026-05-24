@@ -1,84 +1,192 @@
 import { create } from 'zustand';
 import { supabase } from '../lib/supabase';
-import type { Order, Position } from '../lib/supabase';
 import { useAuthStore } from './authStore';
 
-interface OrderBookEntry {
-  price: number;
+interface Position {
+  id: string;
+  user_id: string;
+  type: 'LONG' | 'SHORT';
+  entry_price: number;
   amount: number;
-  count: number;
+  current_price: number;
+  pnl: number;
+  pnl_percent: number;
+  status: 'OPEN' | 'CLOSED' | 'LIQUIDATED';
+  opened_at: string;
+  closed_at?: string;
+  leverage?: number;
+  liquidation_price?: number;
 }
 
 interface TradingState {
-  orders: Order[];
   positions: Position[];
-  orderBook: {
-    bids: OrderBookEntry[];
-    asks: OrderBookEntry[];
-    spread: number;
-    midPrice: number;
-    bestBid: number;
-    bestAsk: number;
-  };
   currentPrice: number;
-  priceHistory: {
-    price: number;
-    change: number;
-    changePercent: number;
-    timestamp: string;
-  }[];
+  priceHistory: Array<{ time: number; value: number }>;
+  leverage: number;
+  positionType: 'LONG' | 'SHORT';
+  amount: number;
   isLoading: boolean;
+  error: string | null;
   pollingInterval: NodeJS.Timeout | null;
 
-  fetchOrders: () => Promise<void>;
-  fetchPositions: () => Promise<void>;
-  fetchOrderBook: () => Promise<void>;
-  fetchPriceFeed: () => Promise<void>;
-  placeOrder: (
-    type: 'BUY' | 'SELL',
-    order_type: 'MARKET' | 'LIMIT',
-    price: number,
-    amount: number
-  ) => Promise<{ success: boolean; error?: string }>;
+  // Computed values
+  margin: number;
+  liquidationPrice: number;
+
+  // Actions
+  setLeverage: (leverage: number) => void;
+  setPositionType: (type: 'LONG' | 'SHORT') => void;
+  setAmount: (amount: number) => void;
+  setCurrentPrice: (price: number) => void;
+
+  // Server actions
+  openPosition: () => Promise<{ success: boolean; error?: string }>;
   closePosition: (positionId: string) => Promise<{ success: boolean; error?: string }>;
+  fetchPositions: () => Promise<void>;
+  fetchPriceFeed: () => Promise<void>;
+
+  // Polling
   startPolling: () => void;
   stopPolling: () => void;
-  setCurrentPrice: (price: number) => void;
 }
 
+const MAINTENANCE_MARGIN_RATE = 0.005; // 0.5%
+
 export const useTradingStore = create<TradingState>((set, get) => ({
-  orders: [],
   positions: [],
-  orderBook: {
-    bids: [],
-    asks: [],
-    spread: 0,
-    midPrice: 100,
-    bestBid: 100,
-    bestAsk: 100,
-  },
   currentPrice: 100,
   priceHistory: [],
+  leverage: 10,
+  positionType: 'LONG',
+  amount: 10,
   isLoading: false,
+  error: null,
   pollingInterval: null,
 
-  fetchOrders: async () => {
+  // Computed margin and liquidation price
+  get margin() {
+    const { amount, leverage } = get();
+    return amount / leverage;
+  },
+
+  get liquidationPrice() {
+    const { positionType, currentPrice, leverage } = get();
+    return positionType === 'LONG'
+      ? currentPrice * (1 - (1 / leverage) + MAINTENANCE_MARGIN_RATE)
+      : currentPrice * (1 + (1 / leverage) - MAINTENANCE_MARGIN_RATE);
+  },
+
+  setLeverage: (leverage) => {
+    set({ leverage: Math.max(1, Math.min(100, leverage)) });
+  },
+
+  setPositionType: (type) => {
+    set({ positionType: type });
+  },
+
+  setAmount: (amount) => {
+    set({ amount: Math.max(1, amount) });
+  },
+
+  setCurrentPrice: (price) => {
+    set({ currentPrice: price });
+  },
+
+  openPosition: async () => {
     const authStore = useAuthStore.getState();
-    if (!authStore.user) return;
+    if (!authStore.user) {
+      return { success: false, error: 'Not authenticated' };
+    }
+
+    const session = (await supabase.auth.getSession()).data.session;
+    if (!session) {
+      return { success: false, error: 'Session expired' };
+    }
+
+    const { positionType, currentPrice, amount, leverage } = get();
+    set({ isLoading: true, error: null });
 
     try {
-      const { data, error } = await supabase
-        .from('orders')
-        .select('*')
-        .eq('user_id', authStore.user.id)
-        .in('status', ['PENDING', 'PARTIALLY_FILLED'])
-        .order('created_at', { ascending: false });
+      const response = await fetch(
+        `${import.meta.env.VITE_SUPABASE_URL}/functions/v1/trading-open-position`,
+        {
+          method: 'POST',
+          headers: {
+            'Content-Type': 'application/json',
+            Authorization: `Bearer ${session.access_token}`,
+          },
+          body: JSON.stringify({
+            position_type: positionType,
+            entry_price: currentPrice,
+            amount,
+            leverage,
+          }),
+        }
+      );
 
-      if (!error && data) {
-        set({ orders: data as Order[] });
+      const data = await response.json();
+
+      set({ isLoading: false });
+
+      if (data.success) {
+        await get().fetchPositions();
+        await useAuthStore.getState().refreshWallet();
+        return { success: true };
       }
-    } catch (error) {
-      console.error('Fetch orders error:', error);
+
+      set({ error: data.error });
+      return { success: false, error: data.error };
+    } catch (error: any) {
+      set({ isLoading: false, error: error.message });
+      return { success: false, error: error.message };
+    }
+  },
+
+  closePosition: async (positionId) => {
+    const authStore = useAuthStore.getState();
+    if (!authStore.user) {
+      return { success: false, error: 'Not authenticated' };
+    }
+
+    const session = (await supabase.auth.getSession()).data.session;
+    if (!session) {
+      return { success: false, error: 'Session expired' };
+    }
+
+    const { currentPrice } = get();
+    set({ isLoading: true, error: null });
+
+    try {
+      const response = await fetch(
+        `${import.meta.env.VITE_SUPABASE_URL}/functions/v1/trading-close-position`,
+        {
+          method: 'POST',
+          headers: {
+            'Content-Type': 'application/json',
+            Authorization: `Bearer ${session.access_token}`,
+          },
+          body: JSON.stringify({
+            position_id: positionId,
+            price: currentPrice,
+          }),
+        }
+      );
+
+      const data = await response.json();
+
+      set({ isLoading: false });
+
+      if (data.success) {
+        await get().fetchPositions();
+        await useAuthStore.getState().refreshWallet();
+        return { success: true };
+      }
+
+      set({ error: data.error });
+      return { success: false, error: data.error };
+    } catch (error: any) {
+      set({ isLoading: false, error: error.message });
+      return { success: false, error: error.message };
     }
   },
 
@@ -95,40 +203,21 @@ export const useTradingStore = create<TradingState>((set, get) => ({
         .order('opened_at', { ascending: false });
 
       if (!error && data) {
-        set({ positions: data as Position[] });
+        // Calculate real-time PnL
+        const { currentPrice } = get();
+        const positionsWithPnL = data.map(pos => {
+          const pnl = pos.type === 'LONG'
+            ? (currentPrice - pos.entry_price) * pos.amount
+            : (pos.entry_price - currentPrice) * pos.amount;
+          const pnl_percent = pos.type === 'LONG'
+            ? ((currentPrice - pos.entry_price) / pos.entry_price) * 100
+            : ((pos.entry_price - currentPrice) / pos.entry_price) * 100;
+          return { ...pos, pnl, pnl_percent };
+        });
+        set({ positions: positionsWithPnL as Position[] });
       }
     } catch (error) {
       console.error('Fetch positions error:', error);
-    }
-  },
-
-  fetchOrderBook: async () => {
-    try {
-      const response = await fetch(
-        `${import.meta.env.VITE_SUPABASE_URL}/functions/v1/trading-get-orderbook`,
-        {
-          headers: {
-            Authorization: `Bearer ${import.meta.env.VITE_SUPABASE_ANON_KEY}`,
-          },
-        }
-      );
-
-      const data = await response.json();
-
-      if (data.bids && data.asks) {
-        set({
-          orderBook: {
-            bids: data.bids,
-            asks: data.asks,
-            spread: data.spread,
-            midPrice: data.mid_price,
-            bestBid: data.best_bid,
-            bestAsk: data.best_ask,
-          },
-        });
-      }
-    } catch (error) {
-      console.error('Fetch order book error:', error);
     }
   },
 
@@ -145,110 +234,19 @@ export const useTradingStore = create<TradingState>((set, get) => ({
 
       const data = await response.json();
 
-      if (data.prices) {
-        set((state) => ({
-          currentPrice: data.currentPrice,
-          priceHistory: [...data.prices, ...state.priceHistory].slice(0, 100),
+      if (data.currentPrice && data.prices) {
+        const priceHistory = data.prices.map((p: any, idx: number) => ({
+          time: Math.floor(Date.now() / 1000) - (data.prices.length - idx - 1) * 60,
+          value: p.price || p,
         }));
+
+        set({ currentPrice: data.currentPrice, priceHistory });
+
+        // Update positions PnL
+        await get().fetchPositions();
       }
     } catch (error) {
       console.error('Fetch price feed error:', error);
-    }
-  },
-
-  placeOrder: async (type, order_type, price, amount) => {
-    const authStore = useAuthStore.getState();
-    if (!authStore.user) {
-      return { success: false, error: 'Not authenticated' };
-    }
-
-    const session = (await supabase.auth.getSession()).data.session;
-    if (!session) {
-      return { success: false, error: 'Session expired' };
-    }
-
-    set({ isLoading: true });
-
-    try {
-      const response = await fetch(
-        `${import.meta.env.VITE_SUPABASE_URL}/functions/v1/trading-place-order`,
-        {
-          method: 'POST',
-          headers: {
-            'Content-Type': 'application/json',
-            Authorization: `Bearer ${session.access_token}`,
-          },
-          body: JSON.stringify({
-            type,
-            order_type,
-            price,
-            amount,
-          }),
-        }
-      );
-
-      const data = await response.json();
-
-      set({ isLoading: false });
-
-      if (data.success) {
-        await get().fetchOrders();
-        await useAuthStore.getState().refreshWallet();
-
-        return { success: true };
-      }
-
-      return { success: false, error: data.error };
-    } catch (error: any) {
-      set({ isLoading: false });
-      return { success: false, error: error.message };
-    }
-  },
-
-  closePosition: async (positionId) => {
-    const authStore = useAuthStore.getState();
-    if (!authStore.user) {
-      return { success: false, error: 'Not authenticated' };
-    }
-
-    const session = (await supabase.auth.getSession()).data.session;
-    if (!session) {
-      return { success: false, error: 'Session expired' };
-    }
-
-    set({ isLoading: true });
-
-    try {
-      const response = await fetch(
-        `${import.meta.env.VITE_SUPABASE_URL}/functions/v1/trading-close-position`,
-        {
-          method: 'POST',
-          headers: {
-            'Content-Type': 'application/json',
-            Authorization: `Bearer ${session.access_token}`,
-          },
-          body: JSON.stringify({
-            position_id: positionId,
-            price: get().currentPrice,
-          }),
-        }
-      );
-
-      const data = await response.json();
-
-      set({ isLoading: false });
-
-      if (data.success) {
-        await get().fetchPositions();
-        await useAuthStore.getState().refreshWallet();
-
-        return { success: true };
-      }
-
-      return { success: false, error: data.error };
-    } catch (error: any) {
-      set({ isLoading: false });
-      return { success: false, error: error.message };
     }
   },
 
@@ -256,16 +254,16 @@ export const useTradingStore = create<TradingState>((set, get) => ({
     const { pollingInterval } = get();
     if (pollingInterval) return;
 
-    const interval = setInterval(() => {
-      get().fetchOrderBook();
-      get().fetchPriceFeed();
+    // Initial fetch
+    get().fetchPriceFeed();
 
+    const interval = setInterval(() => {
+      get().fetchPriceFeed();
       const authStore = useAuthStore.getState();
       if (authStore.user) {
         get().fetchPositions();
-        get().fetchOrders();
       }
-    }, 3000);
+    }, 2000);
 
     set({ pollingInterval: interval });
   },
@@ -277,8 +275,34 @@ export const useTradingStore = create<TradingState>((set, get) => ({
       set({ pollingInterval: null });
     }
   },
-
-  setCurrentPrice: (price) => {
-    set({ currentPrice: price });
-  },
 }));
+
+// Helper function to calculate liquidation price
+export function calculateLiquidationPrice(
+  entryPrice: number,
+  leverage: number,
+  positionType: 'LONG' | 'SHORT',
+  maintenanceMarginRate: number = MAINTENANCE_MARGIN_RATE
+): number {
+  return positionType === 'LONG'
+    ? entryPrice * (1 - (1 / leverage) + maintenanceMarginRate)
+    : entryPrice * (1 + (1 / leverage) - maintenanceMarginRate);
+}
+
+// Helper function to calculate PnL
+export function calculatePnL(
+  entryPrice: number,
+  currentPrice: number,
+  amount: number,
+  positionType: 'LONG' | 'SHORT'
+): { pnl: number; pnlPercent: number } {
+  const pnl = positionType === 'LONG'
+    ? (currentPrice - entryPrice) * amount
+    : (entryPrice - currentPrice) * amount;
+
+  const pnlPercent = positionType === 'LONG'
+    ? ((currentPrice - entryPrice) / entryPrice) * 100
+    : ((entryPrice - currentPrice) / entryPrice) * 100;
+
+  return { pnl, pnlPercent };
+}
