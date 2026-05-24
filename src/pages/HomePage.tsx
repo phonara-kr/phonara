@@ -10,6 +10,10 @@ import { RewardBurst, StreakFire } from '../shared/ui/RewardBurst';
 import { fadeUp, staggerContainer, staggerItem } from '../lib/animations';
 import { Gift, Calendar, Target, Trophy, TrendingUp, Clock, Gamepad2 } from 'lucide-react';
 import { Link } from 'react-router-dom';
+import { StreakCalendar } from '../features/streak/ui/StreakCalendar';
+import { DailyClaimButton } from '../features/streak/ui/DailyClaimButton';
+import { MissionCard } from '../features/missions/ui/MissionCard';
+import { MysteryBox } from '../features/rewards/ui/MysteryBox';
 
 interface ActivityItem {
   id: string;
